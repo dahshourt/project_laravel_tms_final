@@ -51,6 +51,13 @@ class ChangeRequestStatusService
 
     private static ?int $PENDING_DESIGN_STATUS_ID = null;
     private static ?int $REJECTED_STATUS_ID = null;
+    
+    // Status IDs for agreed scope approval workflow
+    private static ?int $PENDING_CREATE_AGREED_SCOPE_STATUS_ID = null;
+    private static ?int $PENDING_AGREED_SCOPE_SA_STATUS_ID = null;
+    private static ?int $PENDING_AGREED_SCOPE_VENDOR_STATUS_ID = null;
+    private static ?int $PENDING_AGREED_SCOPE_BUSINESS_STATUS_ID = null;
+    private static ?int $REQUEST_DRAFT_CR_DOC_STATUS_ID = null;
     // private const PENDING_CAB_STATUS_ID = 38;
     // private const DELIVERED_STATUS_ID = 27;
 
@@ -66,6 +73,13 @@ class ChangeRequestStatusService
         self::$DELIVERED_STATUS_ID = \App\Services\StatusConfigService::getStatusId('Delivered');
         self::$PENDING_DESIGN_STATUS_ID = \App\Services\StatusConfigService::getStatusId('pending_design');
         self::$REJECTED_STATUS_ID = \App\Services\StatusConfigService::getStatusId('Reject');
+        
+        // Initialize agreed scope approval status IDs
+        self::$PENDING_CREATE_AGREED_SCOPE_STATUS_ID = $this->getStatusIdByName('Pending Create Agreed Scope');
+        self::$PENDING_AGREED_SCOPE_SA_STATUS_ID = $this->getStatusIdByName('Pending Agreed Scope Approval-SA');
+        self::$PENDING_AGREED_SCOPE_VENDOR_STATUS_ID = $this->getStatusIdByName('Pending Agreed Scope Approval-Vendor');
+        self::$PENDING_AGREED_SCOPE_BUSINESS_STATUS_ID = $this->getStatusIdByName('Pending Agreed Scope Approval-Business');
+        self::$REQUEST_DRAFT_CR_DOC_STATUS_ID = $this->getStatusIdByName('Request Draft CR Doc');
         $this->statusRepository = new ChangeRequestStatusRepository();
         $this->mailController = new MailController();
     }
@@ -378,6 +392,11 @@ class ChangeRequestStatusService
 
     public function updateChangeRequestStatus(int $changeRequestId, $request): bool
     {
+        Log::info('updateChangeRequestStatus called', [
+            'change_request_id' => $changeRequestId,
+            'request_data' => $request->all()
+        ]);
+        
         try {
             DB::beginTransaction();
 
@@ -388,6 +407,14 @@ class ChangeRequestStatusService
 
             // Process update - determineActiveStatus handles merge point logic
             $this->processStatusUpdate($changeRequest, $statusData, $workflow, $userId, $request);
+            
+            // Handle agreed scope approval transition logic
+            Log::info('About to call handleAgreedScopeApprovalTransition', [
+                'cr_id' => $changeRequest->id,
+                'status_data' => $statusData,
+                'new_status_id' => $statusData['new_status_id'] ?? 'null'
+            ]);
+            $this->handleAgreedScopeApprovalTransition($changeRequest->id, $statusData);
 
             // Activate pending statuses if needed
             $this->activatePendingMergeStatus($changeRequest->id, $statusData);
@@ -855,6 +882,17 @@ class ChangeRequestStatusService
         $workflowActive = $workflow->workflow_type == self::WORKFLOW_NORMAL
             ? self::INACTIVE_STATUS
             : self::COMPLETED_STATUS;
+        
+        // Log for debugging null created_at issue
+        if (is_null($currentStatus->created_at)) {
+            Log::warning('Current status has null created_at', [
+                'cr_id' => $changeRequestId,
+                'status_record_id' => $currentStatus->id,
+                'new_status_id' => $currentStatus->new_status_id,
+                'active' => $currentStatus->active
+            ]);
+        }
+        
         $slaDifference = $this->calculateSlaDifference($currentStatus->created_at);
 
         $shouldUpdate = $this->shouldUpdateCurrentStatus($statusData['old_status_id'], $technicalTeamCounts);
@@ -929,8 +967,12 @@ class ChangeRequestStatusService
     /**
      * Calculate SLA difference in days
      */
-    private function calculateSlaDifference(string $createdAt): int
+    private function calculateSlaDifference(?string $createdAt): int
     {
+        if (!$createdAt) {
+            return 0; // Return 0 if created_at is null
+        }
+        
         return Carbon::parse($createdAt)->diffInDays(Carbon::now());
     }
 
@@ -1095,6 +1137,34 @@ class ChangeRequestStatusService
 
 
         if ($oldStatus && $oldStatus->status_name == 'Pending Create Agreed Scope') {
+
+            Log::info('Transitioning FROM Pending Create Agreed Scope', [
+                'cr_id' => $changeRequest->id,
+                'old_status_id' => $oldStatus->id,
+                'old_status_name' => $oldStatus->status_name,
+                'new_status_id' => $newStatus ? $newStatus->id : 'null',
+                'new_status_name' => $newStatus ? $newStatus->status_name : 'null'
+            ]);
+
+            // ════════════════════════════════════════════════════════════
+            // ✨ SPECIAL CASE: "Need Update" selected
+            // Call our dedicated Need Update action instead of normal workflow
+            // ════════════════════════════════════════════════════════════
+            
+            if ($newStatus && $newStatus->status_name == 'Pending Create Agreed Scope' && 
+                isset($statusData['need_update']) && $statusData['need_update'] === true) {
+                
+                Log::info('Need Update selected - calling dedicated Need Update action', [
+                    'cr_id' => $changeRequest->id,
+                    'new_status_id' => $newStatus->id
+                ]);
+                
+                // Call our Need Update action
+                $this->handleNeedUpdateAction($changeRequest->id);
+                
+                // Return early to skip normal workflow processing
+                return;
+            }
 
             // ════════════════════════════════════════════════════════════
             // ✨ CASE 1: "Request Draft CR Doc" selected
@@ -1732,6 +1802,301 @@ class ChangeRequestStatusService
         }
 
         return $this->dependencyService;
+    }
+
+    /**
+     * Get status ID by status name
+     */
+    private function getStatusIdByName(string $statusName): ?int
+    {
+        $status = Status::where('status_name', $statusName)
+            ->where('active', '1')
+            ->first();
+        
+        return $status ? $status->id : null;
+    }
+
+    /**
+     * Handle agreed scope approval transition logic
+     * When any approval status transitions to "Pending Create Agreed Scope",
+     * deactivate other approval statuses and create new active record
+     */
+    private function handleAgreedScopeApprovalTransition(int $crId, array $statusData): void
+    {
+        $newStatusId = $statusData['new_status_id'] ?? null;
+        
+        // Check if transitioning TO "Pending Create Agreed Scope"
+        if ($newStatusId !== self::$PENDING_CREATE_AGREED_SCOPE_STATUS_ID) {
+            return;
+        }
+
+        Log::info('Handling agreed scope approval transition', [
+            'cr_id' => $crId,
+            'new_status_id' => $newStatusId
+        ]);
+
+        // Define the approval status IDs that should be deactivated
+        $approvalStatusIds = [
+            self::$PENDING_AGREED_SCOPE_SA_STATUS_ID,
+            self::$PENDING_AGREED_SCOPE_VENDOR_STATUS_ID,
+            self::$PENDING_AGREED_SCOPE_BUSINESS_STATUS_ID,
+            self::$REQUEST_DRAFT_CR_DOC_STATUS_ID,
+        ];
+
+        // Filter out null values and the current status
+        $approvalStatusIds = array_filter($approvalStatusIds, function($id) {
+            return $id !== null;
+        });
+
+        if (empty($approvalStatusIds)) {
+            Log::warning('No approval status IDs found for transition handling', [
+                'cr_id' => $crId
+            ]);
+            return;
+        }
+
+        try {
+            // Find and deactivate all active approval statuses for this CR
+            $deactivatedCount = ChangeRequestStatus::where('cr_id', $crId)
+                ->whereIn('new_status_id', $approvalStatusIds)
+                ->active()
+                ->update(['active' => self::INACTIVE_STATUS]);
+
+            Log::info('Deactivated approval statuses and Request Draft CR Doc', [
+                'cr_id' => $crId,
+                'deactivated_count' => $deactivatedCount,
+                'status_ids' => $approvalStatusIds
+            ]);
+
+            // Create a new active record for "Pending Create Agreed Scope"
+            // First check if an active record already exists
+            $existingActiveRecord = ChangeRequestStatus::where('cr_id', $crId)
+                ->where('new_status_id', self::$PENDING_CREATE_AGREED_SCOPE_STATUS_ID)
+                ->active()
+                ->first();
+
+            if ($existingActiveRecord) {
+                Log::info('Active Pending Create Agreed Scope record already exists', [
+                    'cr_id' => $crId,
+                    'existing_record_id' => $existingActiveRecord->id
+                ]);
+                return; // Don't create a duplicate
+            }
+
+            // Get the current user ID
+            $userId = Auth::id();
+            if (!$userId) {
+                // Fallback to system user or first user
+                $userId = User::first()?->id ?? 1;
+            }
+
+            // Find the current status record to get reference data
+            $currentStatus = ChangeRequestStatus::where('cr_id', $crId)
+                ->where('new_status_id', $statusData['old_status_id'])
+                ->first();
+
+            if ($currentStatus) {
+                // Create new active status record
+                $newStatusRecord = new ChangeRequestStatus();
+                $newStatusRecord->cr_id = $crId;
+                $newStatusRecord->old_status_id = $statusData['old_status_id'];
+                $newStatusRecord->new_status_id = self::$PENDING_CREATE_AGREED_SCOPE_STATUS_ID;
+                $newStatusRecord->user_id = $userId;
+                $newStatusRecord->group_id = $currentStatus->group_id;
+                $newStatusRecord->active = self::ACTIVE_STATUS;
+                $newStatusRecord->reference_group_id = $currentStatus->reference_group_id;
+                $newStatusRecord->previous_group_id = $currentStatus->previous_group_id;
+                $newStatusRecord->current_group_id = $currentStatus->current_group_id;
+                $newStatusRecord->save();
+
+                Log::info('Created new active status record', [
+                    'cr_id' => $crId,
+                    'new_status_id' => self::$PENDING_CREATE_AGREED_SCOPE_STATUS_ID,
+                    'record_id' => $newStatusRecord->id
+                ]);
+            } else {
+                Log::warning('Could not find current status record for reference data', [
+                    'cr_id' => $crId,
+                    'old_status_id' => $statusData['old_status_id']
+                ]);
+            }
+        } catch (Exception $e) {
+            Log::error('Error handling agreed scope approval transition', [
+                'cr_id' => $crId,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            throw $e;
+        }
+    }
+
+    /**
+     * Handle "Need Update" action for Change Request
+     * This implements the business logic for when user selects "Need Update" from UI
+     * 
+     * @param int $crId The Change Request ID
+     * @return bool Success status
+     * @throws Exception
+     */
+    public function handleNeedUpdateAction(int $crId): bool
+    {
+        Log::info('Processing Need Update action', [
+            'cr_id' => $crId
+        ]);
+
+        try {
+            DB::beginTransaction();
+
+            // Step 1: Identify the current Change Request
+            $changeRequest = ChangeRequest::find($crId);
+            if (!$changeRequest) {
+                throw new Exception("Change Request not found: {$crId}");
+            }
+
+            // Step 2: Define the parallel approval status names
+            $parallelStatusNames = [
+                'Pending Agreed Scope Approval-SA',
+                'Pending Agreed Scope Approval-Vendor', 
+                'Pending Agreed Scope Approval-Business',
+                'Request Draft CR Doc'
+            ];
+
+            // Step 3: Get the status IDs dynamically
+            $parallelStatusIds = [];
+            foreach ($parallelStatusNames as $statusName) {
+                $statusId = $this->getStatusIdByName($statusName);
+                if ($statusId) {
+                    $parallelStatusIds[] = $statusId;
+                }
+            }
+
+            if (empty($parallelStatusIds)) {
+                Log::warning('No parallel status IDs found', [
+                    'cr_id' => $crId,
+                    'status_names' => $parallelStatusNames
+                ]);
+                DB::rollBack();
+                return false;
+            }
+
+            // Step 4: Update all active records in change_request_statuses 
+            // where new_status_id represents any of the parallel statuses
+            $deactivatedCount = ChangeRequestStatus::where('cr_id', $crId)
+                ->whereIn('new_status_id', $parallelStatusIds)
+                ->active()
+                ->update(['active' => self::INACTIVE_STATUS]);
+
+            Log::info('Deactivated parallel approval statuses', [
+                'cr_id' => $crId,
+                'deactivated_count' => $deactivatedCount,
+                'parallel_status_ids' => $parallelStatusIds
+            ]);
+
+            // If no parallel statuses were found to deactivate, don't proceed with duplication
+            // This prevents creating unnecessary duplicate records
+            if ($deactivatedCount === 0) {
+                Log::info('No parallel statuses found to deactivate, skipping duplication', [
+                    'cr_id' => $crId
+                ]);
+                DB::commit();
+                return false; // Return false to indicate no action was needed
+            }
+
+            // Step 5: Retrieve the latest status record for the same CR
+            $latestStatusRecord = ChangeRequestStatus::where('cr_id', $crId)
+                ->orderBy('created_at', 'desc')
+                ->orderBy('id', 'desc')
+                ->first();
+
+            if (!$latestStatusRecord) {
+                throw new Exception("No status records found for CR: {$crId}");
+            }
+
+            Log::info('Found latest status record', [
+                'cr_id' => $crId,
+                'latest_record_id' => $latestStatusRecord->id,
+                'latest_new_status_id' => $latestStatusRecord->new_status_id
+            ]);
+
+            // Step 6: Duplicate this latest record without changing any data, including new_status_id
+            // Use direct DB insertion to completely avoid triggering model events and workflow logic
+            $duplicatedRecord = $latestStatusRecord->replicate();
+            $duplicatedRecord->active = self::ACTIVE_STATUS; // Only update active = 1
+            $duplicatedRecord->created_at = now(); // Set new creation timestamp
+            $duplicatedRecord->updated_at = null; // Keep consistent with model behavior
+            
+            // Ensure created_at is not null
+            if (!$duplicatedRecord->created_at) {
+                $duplicatedRecord->created_at = now();
+            }
+            
+            // Use direct DB insert to avoid any model events or automatic workflow creation
+            $insertData = $duplicatedRecord->toArray();
+            unset($insertData['id']); // Remove ID to let database generate new one
+            
+            $newRecordId = DB::table('change_request_statuses')->insertGetId($insertData);
+
+            Log::info('Created duplicated record with active=1', [
+                'cr_id' => $crId,
+                'original_record_id' => $latestStatusRecord->id,
+                'duplicated_record_id' => $newRecordId,
+                'new_status_id' => $duplicatedRecord->new_status_id,
+                'active' => $duplicatedRecord->active
+            ]);
+
+            DB::commit();
+
+            // Step 7: Clean up any parallel statuses that might have been created by workflow triggers
+            // This ensures that even if something creates parallel statuses after our action,
+            // we clean them up to maintain the correct state
+            $cleanupCount = ChangeRequestStatus::where('cr_id', $crId)
+                ->whereIn('new_status_id', $parallelStatusIds)
+                ->where('active', '1')
+                ->where('id', '>', $newRecordId) // Only clean up records created after our action
+                ->update(['active' => self::INACTIVE_STATUS]);
+
+            if ($cleanupCount > 0) {
+                Log::info('Cleaned up parallel statuses created by workflow triggers', [
+                    'cr_id' => $crId,
+                    'cleanup_count' => $cleanupCount,
+                    'parallel_status_ids' => $parallelStatusIds
+                ]);
+            }
+
+            // Step 8: Also clean up any parallel statuses that were created in the same transaction
+            // This handles the case where workflow creates parallel statuses before our action
+            $sameTransactionCleanup = ChangeRequestStatus::where('cr_id', $crId)
+                ->whereIn('new_status_id', $parallelStatusIds)
+                ->where('active', '1')
+                ->where('created_at', '>=', now()->subMinutes(5)) // Records created in the last 5 minutes
+                ->where('id', '!=', $newRecordId) // Don't deactivate our own record
+                ->update(['active' => self::COMPLETED_STATUS]); // Use COMPLETED_STATUS (2) instead of INACTIVE_STATUS (0)
+
+            if ($sameTransactionCleanup > 0) {
+                Log::info('Cleaned up parallel statuses created in same transaction', [
+                    'cr_id' => $crId,
+                    'cleanup_count' => $sameTransactionCleanup,
+                    'parallel_status_ids' => $parallelStatusIds
+                ]);
+            }
+
+            Log::info('Need Update action completed successfully', [
+                'cr_id' => $crId,
+                'deactivated_count' => $deactivatedCount,
+                'duplicated_record_id' => $newRecordId
+            ]);
+
+            return true;
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            Log::error('Error processing Need Update action', [
+                'cr_id' => $crId,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            throw $e;
+        }
     }
 
     // Check if this is a transition from Pending CAB status to pending design status workflow 160
