@@ -195,23 +195,26 @@
                                             </a>
                                         @endcan
 
-                                        @if(in_array($cr->id, $crs_in_queues->toArray()))
-                                            @if(!(($cr->workflow_type_id == 5) && (in_array($cr->Req_status()->latest('id')->first()?->new_status_id, [66, 67, 68, 69]))))
-                                                @can('Edit ChangeRequest')
-                                                    @if(in_array($status->new_status_id, $user_group->group_statuses->where('type', 2)->pluck('status_id')->toArray()))
-                                                        @if(!$status->group_id OR $status->current_group_id == $user_group->id)
-                                                            @if($cr->getSetStatus()->count() > 0)
-                                                                <a href='{{ url("$route") }}/{{ $cr->id }}/edit?reference_status={{ $status->id }}'
-                                                                    class="btn btn-light-success btn-sm" title="Edit"
-                                                                    style="padding: 0.4rem 0.9rem; border-radius: 0 4px 4px 0;">
-                                                                    <i class="la la-edit"></i> Edit
-                                                                </a>
-                                                            @endif
+                                        {{-- Edit button in details row: removed $crs_in_queues check since
+                                             the per-status checks below (View By status match, group match,
+                                             workflow transitions) are sufficient for authorization.
+                                             The $crs_in_queues list is filtered by current group's applications
+                                             and group_id, which excludes CRs that the Vendor group should
+                                             still be able to edit via search results. --}}
+                                        @if(!(($cr->workflow_type_id == 5) && (in_array($cr->Req_status()->latest('id')->first()?->new_status_id, [66, 67, 68, 69]))))
+                                            @can('Edit ChangeRequest')
+                                                @if(in_array($status->new_status_id, $user_group->group_statuses->where('type', 2)->pluck('status_id')->toArray()))
+                                                    @if(!$status->group_id || is_null($status->current_group_id) || $status->current_group_id == $user_group->id)
+                                                        @if($cr->getSetStatus()->count() > 0)
+                                                            <a href='{{ url("$route") }}/{{ $cr->id }}/edit?reference_status={{ $status->id }}'
+                                                                class="btn btn-light-success btn-sm" title="Edit"
+                                                                style="padding: 0.4rem 0.9rem; border-radius: 0 4px 4px 0;">
+                                                                <i class="la la-edit"></i> Edit
+                                                            </a>
                                                         @endif
-
                                                     @endif
-                                                @endcan
-                                            @endif
+                                                @endif
+                                            @endcan
                                         @endif
                                     </div>
                                 </td>
